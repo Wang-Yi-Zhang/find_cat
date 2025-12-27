@@ -3,213 +3,278 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>PWA 圓形迷霧探索 (自建演算法)</title>
+    <title>PWA 長效迷霧探索 (7天版)</title>
     
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     
     <style>
-        body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+        body { margin: 0; padding: 0; overflow: hidden; background: #000; font-family: sans-serif; }
         #map { width: 100vw; height: 100vh; }
         
+        /* 迷霧層 Canvas */
         #fog-canvas {
             position: absolute;
             top: 0; left: 0;
             width: 100%; height: 100%;
-            pointer-events: none; /* 點擊穿透 */
+            pointer-events: none;
             z-index: 1000;
         }
 
+        /* 狀態列 */
         #status-bar {
             position: absolute;
-            bottom: 30px; left: 20px; right: 20px;
+            top: 20px; left: 20px; right: 20px;
             z-index: 2000;
-            background: rgba(0,0,0,0.8);
-            color: #0f0; /* 駭客風格綠字 */
-            padding: 15px;
-            border-radius: 8px;
-            font-family: monospace;
-            font-size: 14px;
+            background: rgba(0,0,0,0.6);
+            color: #fff;
+            padding: 10px 15px;
+            border-radius: 20px;
+            backdrop-filter: blur(5px);
+            font-size: 13px;
             pointer-events: none;
-            line-height: 1.5;
+            text-align: center;
+        }
+
+        /* 定位按鈕樣式 */
+        #locate-btn {
+            position: absolute;
+            bottom: 40px;
+            right: 20px;
+            z-index: 2001; /* 必須高於地圖 */
+            width: 50px;
+            height: 50px;
+            background: #fff;
+            border-radius: 50%;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.2s;
+        }
+        #locate-btn:active { transform: scale(0.95); }
+        #locate-btn svg { width: 24px; height: 24px; fill: #333; }
+        
+        /* 載入中遮罩 */
+        #loading {
+            position: absolute; top:0; left:0; width:100%; height:100%;
+            background: #000; z-index: 3000;
+            display: flex; align-items: center; justify-content: center;
+            color: #fff; transition: opacity 0.5s;
         }
     </style>
 </head>
 <body>
 
+    <div id="loading">系統初始化中...</div>
     <div id="map"></div>
     <canvas id="fog-canvas"></canvas>
     
     <div id="status-bar">
-        系統狀態: 偵測中...<br>
-        有效路徑點: <span id="point-count">0</span> 個<br>
-        (若 10 秒無人經過，路徑將被迷霧吞噬)
+        迷霧時效: 7天 <br> 
+        有效據點: <span id="point-count">0</span>
     </div>
+
+    <button id="locate-btn" title="回到目前位置">
+        <svg viewBox="0 0 24 24">
+            <path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm8.94 3c-.46-4.17-3.77-7.48-7.94-7.94V1h-2v2.06C6.83 3.52 3.52 6.83 3.06 11H1v2h2.06c.46 4.17 3.77 7.48 7.94 7.94V23h2v-2.06c4.17-.46 7.48-3.77 7.94-7.94H23v-2h-2.06zM12 19c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
+        </svg>
+    </button>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
     <script>
-        // --- 核心參數設定 ---
+        // --- 1. 核心參數設定 ---
         const CONFIG = {
-            fogTimeout: 10000,    // 10秒後迷霧重生
-            fogOpacity: 0.9,      // 迷霧濃度 (0~1)
-            exploreRadius: 20,    // 探索半徑 (公尺) - 這是地理上的實際距離
-            recordThreshold: 5,   // 移動超過 5 公尺才記錄新點 (避免原地漂移造成資料爆炸)
-            softEdge: true        // 是否開啟邊緣羽化 (漸層效果)
+            // 7天 = 7 * 24 * 60 * 60 * 1000 毫秒
+            fogTimeout: 604800000, 
+            exploreRadius: 20,    // 探索半徑 (公尺)
+            recordThreshold: 5,   // 移動超過 5 公尺才記錄新點
+            initialZoom: 17,      // 初始 Zoom 17 (約 1.1m/px，20m半徑約佔手機螢幕 10%)
+            storageKey: 'fog_path_data_v1' // LocalStorage Key
         };
 
-        // --- 資料結構 ---
-        // 儲存所有的圓心資料: { lat, lng, lastVisited, id }
+        // --- 2. 初始化地圖 ---
+        // 預設先定在一個通用位置，等待 GPS 更新
+        const map = L.map('map', { 
+            zoomControl: false,
+            attributionControl: false 
+        }).setView([25.0330, 121.5654], CONFIG.initialZoom);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+        // --- 3. 資料管理 (含 LocalStorage) ---
         let pathPoints = []; 
+        let currentPosition = null; // [lat, lng]
 
-        // --- 初始化地圖 ---
-        const map = L.map('map', { zoomControl: false }).setView([25.0330, 121.5654], 17);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '&copy; OpenStreetMap'
-        }).addTo(map);
+        // 從 LocalStorage 讀取舊資料
+        function loadData() {
+            const raw = localStorage.getItem(CONFIG.storageKey);
+            if (raw) {
+                try {
+                    const saved = JSON.parse(raw);
+                    const now = Date.now();
+                    // 讀取時順便過濾掉超過 7 天的過期資料
+                    pathPoints = saved.filter(p => (now - p.lastVisited) < CONFIG.fogTimeout);
+                    console.log(`已載入 ${pathPoints.length} 個有效路徑點`);
+                } catch (e) {
+                    console.error("讀取存檔失敗", e);
+                }
+            }
+            document.getElementById('loading').style.opacity = 0;
+            setTimeout(() => document.getElementById('loading').style.display = 'none', 500);
+            drawFog(); // 載入後立即重繪
+        }
 
-        // --- Canvas 設定 ---
+        // 儲存資料到 LocalStorage (建議使用 debounce 避免太頻繁寫入)
+        let saveTimeout;
+        function saveData() {
+            clearTimeout(saveTimeout);
+            saveTimeout = setTimeout(() => {
+                // 只存必要的欄位以節省空間 (最多存幾千點，若更多需考慮 IndexedDB)
+                localStorage.setItem(CONFIG.storageKey, JSON.stringify(pathPoints));
+            }, 1000); // 延遲1秒寫入
+        }
+
+        // --- 4. 繪圖引擎 (Canvas) ---
         const canvas = document.getElementById('fog-canvas');
         const ctx = canvas.getContext('2d');
 
         function resizeCanvas() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
-            drawFog(); // 視窗改變時重繪
+            drawFog();
         }
         window.addEventListener('resize', resizeCanvas);
         resizeCanvas();
 
-        // --- 核心演算法：空間資料更新 ---
+        function drawFog() {
+            const now = Date.now();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 迷霧背景
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.fillStyle = `rgba(0, 0, 0, 0.9)`;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // 準備挖洞 (Destination-Out)
+            ctx.globalCompositeOperation = 'destination-out';
+            
+            // 計算當前縮放層級下的像素半徑
+            // 公式：(實際公尺 / 每像素公尺)
+            // 這裡使用更精確的緯度校正
+            const centerLat = map.getCenter().lat;
+            const metersPerPixel = 40075016.686 * Math.abs(Math.cos(centerLat * Math.PI / 180)) / Math.pow(2, map.getZoom() + 8);
+            const pixelRadius = CONFIG.exploreRadius / metersPerPixel;
+
+            const activePoints = [];
+
+            pathPoints.forEach(p => {
+                // 檢查 7 天過期
+                if (now - p.lastVisited > CONFIG.fogTimeout) return;
+                
+                activePoints.push(p);
+
+                // 畫布邊界檢查 (效能優化：只畫螢幕內的點)
+                const point = map.latLngToContainerPoint([p.lat, p.lng]);
+                
+                // 寬鬆邊界檢查 (半徑外加一點 buffer)
+                if (point.x < -pixelRadius || point.x > canvas.width + pixelRadius ||
+                    point.y < -pixelRadius || point.y > canvas.height + pixelRadius) {
+                    return; 
+                }
+
+                // 繪製柔邊圓形
+                const gradient = ctx.createRadialGradient(point.x, point.y, pixelRadius * 0.5, point.x, point.y, pixelRadius);
+                gradient.addColorStop(0, 'rgba(0,0,0,1)');
+                gradient.addColorStop(1, 'rgba(0,0,0,0)');
+                ctx.fillStyle = gradient;
+                
+                ctx.beginPath();
+                ctx.arc(point.x, point.y, pixelRadius, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            // 如果有過期點被剔除，這裡會更新記憶體中的陣列
+            if (activePoints.length !== pathPoints.length) {
+                pathPoints = activePoints;
+                saveData(); // 有刪除發生，存檔
+            }
+            
+            document.getElementById('point-count').innerText = pathPoints.length;
+        }
+
+        // --- 5. 位置更新邏輯 ---
         function updateLocation(lat, lng) {
             const now = Date.now();
             let foundNearby = false;
 
-            // 1. 檢查是否已經在某個舊點的範圍內 (更新舊點時間)
-            // 為了效能，我們倒序搜尋 (因為人最可能在剛走過的地方)
+            // 倒序搜尋，優先比對最近的點
             for (let i = pathPoints.length - 1; i >= 0; i--) {
                 const p = pathPoints[i];
-                // 使用 Leaflet 內建的高效率距離計算 (公尺)
                 const dist = map.distance([lat, lng], [p.lat, p.lng]);
                 
                 if (dist < CONFIG.recordThreshold) {
-                    p.lastVisited = now; // 更新時間，續命
-                    p.lat = lat;         // 修正位置 (微調到最新位置)
+                    p.lastVisited = now; // 續命 (重置7天計時)
+                    p.lat = lat; // 更新座標中心
                     p.lng = lng;
                     foundNearby = true;
+                    // 若有變更，觸發存檔
+                    saveData();
                     break;
                 }
             }
 
-            // 2. 如果附近沒有點，則新增一個新點
             if (!foundNearby) {
-                pathPoints.push({
-                    lat: lat,
-                    lng: lng,
-                    lastVisited: now
-                });
+                pathPoints.push({ lat, lng, lastVisited: now });
+                saveData(); // 新增點，觸發存檔
             }
 
-            // 3. 更新 UI 計數
-            document.getElementById('point-count').innerText = pathPoints.length;
-            
-            // 4. 觸發重繪
             requestAnimationFrame(drawFog);
         }
 
-        // --- 核心演算法：Canvas 繪圖與物理半徑換算 ---
-        function drawFog() {
-            const now = Date.now();
+        // --- 6. GPS 與互動 ---
+        let firstLocate = true;
 
-            // 1. 清空畫布
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            // 2. 畫上全黑背景 (迷霧)
-            ctx.globalCompositeOperation = 'source-over';
-            ctx.fillStyle = `rgba(0, 0, 0, ${CONFIG.fogOpacity})`;
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-            // 3. 設定「擦除模式」
-            ctx.globalCompositeOperation = 'destination-out';
-
-            // 4. 計算「1公尺」在地圖當前縮放層級下，等於螢幕多少像素 (px)
-            // 這是實現「圓形物理半徑」的關鍵
-            const centerLatLng = map.getCenter();
-            const centerPoint = map.latLngToContainerPoint(centerLatLng);
-            // 找一個距離中心 exploreRadius 公尺的點
-            // 這裡簡化計算：緯度不變，只加經度 (在小範圍內誤差可忽略)
-            // 為了精確，我們可以用 Leaflet 的工具計算邊緣像素
-            // 簡單版：取地圖上一點，算它右邊 x 公尺的點，然後算像素差
-            // 這裡使用更精確的方式：
-            const metersPerPixel = 40075016.686 * Math.abs(Math.cos(centerLatLng.lat * Math.PI / 180)) / Math.pow(2, map.getZoom() + 8);
-            const pixelRadius = CONFIG.exploreRadius / metersPerPixel;
-
-            // 5. 遍歷並繪製有效的點
-            // 同時過濾掉過期的點 (Garbage Collection)
-            const activePoints = [];
-            
-            pathPoints.forEach(p => {
-                // (A) 檢查時間是否過期
-                if (now - p.lastVisited > CONFIG.fogTimeout) {
-                    return; // 過期了，丟棄 (不加入 activePoints，下一次迴圈它就永遠消失了)
-                }
-                activePoints.push(p);
-
-                // (B) 座標轉換 (LatLng -> Screen Pixel)
-                // 為了效能，先判斷該點是否在螢幕範圍內 (Bounding Box Check)
-                // 這裡略過優化，直接畫
-                const point = map.latLngToContainerPoint([p.lat, p.lng]);
-
-                // (C) 繪製圓形擦除
-                ctx.beginPath();
-                ctx.arc(point.x, point.y, pixelRadius, 0, Math.PI * 2);
-                
-                if (CONFIG.softEdge) {
-                    // 建立徑向漸層，讓邊緣有羽化效果 (看起來像真實迷霧)
-                    const gradient = ctx.createRadialGradient(point.x, point.y, pixelRadius * 0.5, point.x, point.y, pixelRadius);
-                    gradient.addColorStop(0, 'rgba(0,0,0,1)');   // 中心完全擦除
-                    gradient.addColorStop(1, 'rgba(0,0,0,0)');   // 邊緣不擦除
-                    ctx.fillStyle = gradient;
-                } else {
-                    ctx.fillStyle = 'rgba(0,0,0,1)';
-                }
-                
-                ctx.fill();
-            });
-
-            // 更新陣列 (移除已過期的點)
-            pathPoints = activePoints;
-        }
-
-        // --- GPS 啟動 ---
         if ('geolocation' in navigator) {
             navigator.geolocation.watchPosition((pos) => {
                 const { latitude, longitude } = pos.coords;
-                
-                // 選擇性：跟隨使用者
-                // map.panTo([latitude, longitude]); 
+                currentPosition = [latitude, longitude];
 
                 updateLocation(latitude, longitude);
 
+                // 第一次定位成功時，自動飛到該處並設定 Zoom 17
+                if (firstLocate) {
+                    map.setView([latitude, longitude], CONFIG.initialZoom);
+                    firstLocate = false;
+                }
+
             }, (err) => {
-                console.error("GPS Error:", err);
-                document.getElementById('status-bar').innerHTML = "GPS 錯誤: " + err.message;
+                console.warn("GPS Error", err);
             }, {
-                enableHighAccuracy: true,
-                maximumAge: 0,
-                timeout: 5000
+                enableHighAccuracy: true, maximumAge: 0
             });
         }
 
-        // --- 地圖互動事件 ---
-        // 當縮放或移動地圖時，因為像素位置變了，必須重繪
+        // 定位按鈕功能
+        document.getElementById('locate-btn').addEventListener('click', () => {
+            if (currentPosition) {
+                map.flyTo(currentPosition, CONFIG.initialZoom, {
+                    animate: true,
+                    duration: 1.5
+                });
+            } else {
+                alert("尚未獲取到 GPS 位置");
+            }
+        });
+
+        // 地圖操作事件監聽
         map.on('move', () => requestAnimationFrame(drawFog));
         map.on('zoom', () => requestAnimationFrame(drawFog));
 
-        // --- 定時循環 ---
-        // 每 100ms 強制檢查一次過期狀態 (讓迷霧消失的動畫更流暢)
-        setInterval(() => {
-            requestAnimationFrame(drawFog);
-        }, 100);
+        // 啟動程式
+        loadData();
 
     </script>
 </body>
